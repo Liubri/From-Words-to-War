@@ -2,6 +2,9 @@
 UNGDC_1946-2023.csv
 geopolitical_conflict_risk_dataset.csv
 
+# Photo
+conflict_analysis_results.png
+
 # Python
 __pycache__/
 *.py[cod]
