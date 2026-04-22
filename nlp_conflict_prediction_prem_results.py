@@ -43,6 +43,13 @@ ungdc['year'] = pd.to_numeric(ungdc['year'], errors='coerce')
 ungdc = ungdc.dropna(subset=['year'])
 ungdc['year'] = ungdc['year'].astype(int)
 
+# The UNGDC file contains both full country names and ISO-3 country codes.
+# Use ISO-3 where available so it can align with the conflict dataset.
+if 'ccodealp' in ungdc.columns:
+  ungdc['country_code'] = ungdc['ccodealp'].astype(str).str.upper().str.strip()
+else:
+  ungdc['country_code'] = ungdc['country'].astype(str).str.upper().str.strip()
+
 print(f"Loaded {len(ungdc)} speeches from {ungdc['country'].nunique()} countries")
 print(f"Date range: {ungdc['year'].min()}-{ungdc['year'].max()}")
 
@@ -102,8 +109,10 @@ if not os.path.exists(DATA_CSV):
     sys.exit(1)
 
 df = pd.read_csv(DATA_CSV)
-df = df.dropna(subset=['region', 'month', 'social_media_sentiment', 'conflict_escalation_6m'])
-df['month'] = pd.to_datetime(df['month'])
+df = df.dropna(subset=['country', 'region', 'month', 'social_media_sentiment', 'conflict_escalation_6m'])
+df['country'] = df['country'].astype(str).str.upper().str.strip()
+df['month'] = pd.to_datetime(df['month'], format='%Y-%m', errors='coerce')
+df = df.dropna(subset=['month'])
 df = df.sort_values('month')
 
 print(f"Loaded {len(df)} records from {df['month'].min().date()} to {df['month'].max().date()}")
@@ -125,15 +134,63 @@ print("="*70)
 
 # Prepare features
 print("\nPreparing features...")
-sentiment_ts = df.groupby(['region', 'month'])['social_media_sentiment'].mean().reset_index()
-sentiment_ts = sentiment_ts.rename(columns={'social_media_sentiment': 'sentiment'})
 
-escalation_merge = df[['region', 'month', 'conflict_escalation_6m']].drop_duplicates()
-features = sentiment_ts.merge(escalation_merge, on=['region', 'month'], how='left')
+# Build a clean country-month modeling table from conflict data.
+conflict_model = (
+  df[['country', 'region', 'month', 'social_media_sentiment', 'conflict_escalation_6m']]
+  .drop_duplicates(subset=['country', 'month'])
+  .copy()
+)
+conflict_model['year'] = conflict_model['month'].dt.year
+
+# Aggregate UNGDC sentiment by country-year.
+ungdc_country_year = (
+  ungdc.groupby(['country_code', 'year'], as_index=False)
+  .agg(ungdc_sentiment=('sentiment', 'mean'))
+  .rename(columns={'country_code': 'country'})
+)
+
+# Global yearly fallback for countries/years missing in UNGDC country-level data.
+ungdc_global_year = (
+  ungdc.groupby('year', as_index=False)
+  .agg(ungdc_global_sentiment=('sentiment', 'mean'))
+)
+
+# For each country-month conflict record, attach the most recent available
+# UNGDC country-year sentiment (backward as-of merge).
+conflict_model = conflict_model.sort_values('year')
+ungdc_country_year = ungdc_country_year.sort_values('year')
+
+conflict_model['year'] = conflict_model['year'].astype('int64')
+ungdc_country_year['year'] = ungdc_country_year['year'].astype('int64')
+features = pd.merge_asof(
+  conflict_model,
+  ungdc_country_year,
+  on='year',
+  by='country',
+  direction='backward',
+)
+features['year'] = features['year'].astype('int64')
+ungdc_global_year['year'] = ungdc_global_year['year'].astype('int64')
+
+# Fill remaining gaps with global UN sentiment trend by year.
+features = pd.merge_asof(
+  features.sort_values('year'),
+  ungdc_global_year.sort_values('year'),
+  on='year',
+  direction='backward',
+)
+features['ungdc_sentiment'] = features['ungdc_sentiment'].fillna(features['ungdc_global_sentiment'])
+
+# Logistic-regression baseline with sentiment as the only feature.
+# This combines sentiment signals from both datasets into one scalar feature.
+features['sentiment'] = features[['social_media_sentiment', 'ungdc_sentiment']].mean(axis=1)
+features = features.dropna(subset=['sentiment', 'conflict_escalation_6m'])
 features = features.rename(columns={'conflict_escalation_6m': 'escalation'})
-features = features.dropna(subset=['escalation'])
+features['escalation'] = features['escalation'].astype(int)
 
-print(f"Features: {len(features)} region-month records")
+print(f"Features: {len(features)} country-month records")
+print(f"Countries matched to UNGDC sentiment: {features['country'].nunique()}")
 
 # Train model
 X = features[['sentiment']].values
@@ -152,12 +209,14 @@ print(f"Training accuracy: {train_acc:.3f}")
 print(f"Testing accuracy: {test_acc:.3f}")
 
 # Compute confusion matrix and metrics
-cm = confusion_matrix(y_test, preds)
+cm = confusion_matrix(y_test, preds, labels=[0, 1])
 tn, fp, fn, tp = cm.ravel()
 
 print(f"\nConfusion Matrix:")
 print(f"  True Negatives: {tn}  |  False Positives: {fp}")
 print(f"  False Negatives: {fn}  |  True Positives: {tp}")
+print("\nClassification Report:")
+print(classification_report(y_test, preds, digits=3))
 
 # ============================================================================
 # PART 4: VISUALIZATIONS
